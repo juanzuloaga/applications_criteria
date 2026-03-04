@@ -1,0 +1,388 @@
+---
+title: "shiny criteria app"
+format: html
+editor: visual
+---
+
+## Shiny
+
+```{r}
+library(shiny)
+library(dplyr)
+library(DT)
+library(purrr)
+library(plotly)
+library(stringr)
+library(officer) 
+
+# --- 1. Load and Prepare Data ---
+apps <- read.csv("model_applications.csv", stringsAsFactors = FALSE, check.names = FALSE)
+criteria_df <- read.csv("model_criteria.csv", stringsAsFactors = FALSE, check.names = FALSE)
+glossary <- read.csv("glossary_app.csv", stringsAsFactors = FALSE, check.names = FALSE)
+
+# Load the Landing Page content directly from the .docx file 
+read_landing_docx <- function(filepath) {
+  if(!file.exists(filepath)) return(rep("", 20))
+  doc <- read_docx(filepath)
+  content <- docx_summary(doc)
+  return(content$text[content$content_type == "paragraph"])
+}
+
+landing_lines <- read_landing_docx("tab1_landing_page_intro.docx")
+
+clean_flags <- function(df) {
+  cols_to_fix <- c("Explanation (Hypothesis testing)", "Predictions (spatially explicit)", 
+                   "Predictions (Non-spatially explicit)", "Projection (Extrapolation)")
+  df %>% mutate(across(any_of(cols_to_fix), ~ {
+    val <- as.numeric(.)
+    ifelse(is.na(val), 0, val)
+  }))
+}
+apps <- clean_flags(apps)
+criteria_df <- clean_flags(criteria_df)
+
+RISK_LEVELS <- c("Very high", "High", "Moderate", "Low")
+RISK_COLORS <- c("Very high" = "#ff4d4d", "High" = "#ffb3b3", "Moderate" = "#ffffcc", "Low" = "#c2f0c2")
+RISK_BORDER_COLORS <- c("Very high" = "#d32f2f", "High" = "#f48fb1", "Moderate" = "#fbc02d", "Low" = "#388e3c")
+
+# --- 2. UI ---
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      th { vertical-align: bottom !important; white-space: normal !important; }
+      .dataTables_wrapper { overflow-x: hidden !important; }
+      .glossary-link { color: #2980b9; text-decoration: underline; cursor: pointer; font-weight: 600; }
+      .glossary-link:hover { color: #1a5276; background-color: #ebf5fb; }
+      .count-badge { padding: 4px 12px; border-radius: 20px; font-weight: bold; display: inline-block; font-size: 0.75em; color: white; margin-bottom: 5px;}
+      .guide-section { margin-bottom: 5px; padding: 5px 15px; border-left: 5px solid #2c3e50; background: #fdfdfd; }
+      .guide-section h4 { margin-top: 2px; margin-bottom: 2px; }
+      .guide-section p, .guide-section ul { margin-bottom: 2px; }
+      .step-box { background: #e8f4f8; padding: 10px; border-radius: 5px; margin-top: 5px; border: 1px solid #d1e9f0; }
+      .nav-hint { margin-top: 8px; font-style: italic; color: #7f8c8d; border-top: 1px solid #eee; padding-top: 5px; }
+      .centered-intro { text-align: center; margin-bottom: 10px; }
+      .selection-bar { background-color: #fff3cd; color: #856404; padding: 12px 20px; border: 1px solid #ffeeba; border-radius: 5px; margin-bottom: 15px; font-weight: 500; font-size: 1.1em; }
+      .section-title { background-color: #2c3e50; color: white; padding: 10px 15px; border-radius: 5px; margin-bottom: 15px; font-size: 1.1em; font-weight: bold; }
+      .custom-legend { text-align: center; margin-top: 5px; margin-bottom: 15px; padding: 8px; background: #f8f9fa; border-radius: 8px; border: 1px solid #ddd; }
+      .legend-item { display: inline-block; margin: 0 12px; font-size: 0.8em; font-weight: bold; }
+      .legend-box { display: inline-block; width: 10px; height: 10px; margin-right: 5px; border: 1px solid #666; vertical-align: middle; }
+    "))
+  ),
+  theme = bslib::bs_theme(version = 5, bootswatch = "flatly"),
+  titlePanel("SDM Application & Criteria Selector"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("1. Model Application Context"),
+      selectInput("cat_select", "Select Application Category:", choices = sort(unique(apps$Model_application_category))),
+      uiOutput("subcat_ui"),
+      hr(),
+      h4("2. Model Type"),
+      radioButtons("type_select", "Select the general purpose of your model application:",
+                   choices = c("Explanation (Hypothesis testing)", "Predictions (spatially explicit)",
+                               "Predictions (Non-spatially explicit)", "Projection (Extrapolation)"), 
+                   selected = character(0)),
+      hr(),
+      h4("3. Model Performance & Risk"),
+      fluidRow(
+        column(6, checkboxGroupInput("omission_filter", "Omission Error:", choices = RISK_LEVELS, selected = character(0))),
+        column(6, checkboxGroupInput("commission_filter", "Commission Error:", choices = RISK_LEVELS, selected = character(0)))
+      )
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Objective & Guidance", br(),
+                 div(class = "centered-intro",
+                     h3(uiOutput("intro_title")),
+                     h4(style = "color: #2c3e50; font-weight: bold;", uiOutput("intro_subtitle"))
+                 ),
+                 div(class="guide-section", h4(style="color: #18bc9c;", uiOutput("goal_header")), uiOutput("goal_text")),
+                 div(class="guide-section", h4(style="color: #2980b9;", uiOutput("motivation_header")), uiOutput("motivation_text")),
+                 div(class="guide-section", h4(style="color: #e67e22;", uiOutput("approach_header")), uiOutput("approach_text"),
+                     div(class="step-box", uiOutput("steps_text"))
+                 )
+        ),
+        tabPanel("Selected Application Context", br(), 
+                 uiOutput("selection_display_tab2"),
+                 uiOutput("app_profile_display")),
+        tabPanel("Applicable Criteria", br(), 
+                 uiOutput("selection_display_tab3"),
+                 fluidRow(
+                   column(8, 
+                          div(class = "section-title", "Summary of criteria along the model cycle"),
+                          fluidRow(column(6, align="center", uiOutput("omission_count_header")), column(6, align="center", uiOutput("commission_count_header"))),
+                          fluidRow(
+                            column(6, div(style = "background-color: #ffffff; border: 1px solid #ddd; padding: 5px; border-radius: 8px; margin-bottom: 10px;", h6(style="text-align: center; font-weight: bold; margin-bottom:0; font-size: 0.8em;", "Omission Counts"), plotlyOutput("radar_omission", height = "280px"))),
+                            column(6, div(style = "background-color: #ffffff; border: 1px solid #ddd; padding: 5px; border-radius: 8px; margin-bottom: 10px;", h6(style="text-align: center; font-weight: bold; margin-bottom:0; font-size: 0.8em;", "Commission Counts"), plotlyOutput("radar_commission", height = "280px")))
+                          ),
+                          div(class = "custom-legend",
+                              div(class="legend-item", span(class="legend-box", style=paste0("background:", RISK_COLORS["Very high"])), "Very high"),
+                              div(class="legend-item", span(class="legend-box", style=paste0("background:", RISK_COLORS["High"])), "High"),
+                              div(class="legend-item", span(class="legend-box", style=paste0("background:", RISK_COLORS["Moderate"])), "Moderate"),
+                              div(class="legend-item", span(class="legend-box", style=paste0("background:", RISK_COLORS["Low"])), "Low")
+                          ),
+                          div(style = "text-align: center; margin-bottom: 15px;", uiOutput("combined_count_footer")),
+                          hr(),
+                          div(class = "section-title", "List of criteria (click on any row to display relevant information on the right)"),
+                          div(style = "height: 40vh; overflow-y: auto; padding-right: 5px;", uiOutput("criteria_tables_ui"))
+                   ),
+                   column(4, 
+                          div(class = "section-title", "Criterion Details"),
+                          wellPanel(style = "height: 85vh; overflow-y: auto; background-color: #fcfcfc; border: 1px solid #ddd; border-top: 5px solid #18bc9c; padding: 15px;",
+                                    uiOutput("details_panel")))
+                 )
+        )
+      )
+    )
+  )
+)
+
+# --- 3. Server ---
+server <- function(input, output, session) {
+  
+  selected_row_data <- reactiveVal(NULL)
+
+  # --- Glossary Linking: Only links the FIRST occurrence of a term ---
+  create_glossary_links <- function(text) {
+    if (is.null(text) || text == "" || is.na(text) || text == "NA") return("")
+    
+    terms <- glossary$Term
+    terms <- terms[order(nchar(terms), decreasing = TRUE)]
+    processed_text <- text
+    
+    for (term in terms) {
+      # This regex looks for the word \b(term)\b
+      pattern <- paste0("(?i)\\b(", term, ")(s|es)?\\b(?!([^<]*>))")
+      
+      # Check if term exists in text
+      if (str_detect(processed_text, pattern)) {
+        # str_replace (singular) only replaces the FIRST occurrence
+        replacement <- paste0("<a class='glossary-link' onclick=\"Shiny.setInputValue('glossary_click', '", term, "', {priority: 'event'})\">\\0</a>")
+        processed_text <- str_replace(processed_text, pattern, replacement)
+      }
+    }
+    return(HTML(processed_text))
+  }
+
+  # --- Tab 1 Loading ---
+  output$intro_title <- renderUI({ landing_lines[1] }) 
+  output$intro_subtitle <- renderUI({ landing_lines[2] }) 
+  output$goal_header <- renderUI({ landing_lines[3] }) 
+  output$goal_text <- renderUI({ create_glossary_links(landing_lines[4]) }) 
+  output$motivation_header <- renderUI({ landing_lines[5] }) 
+  output$motivation_text <- renderUI({
+    # Because these are individual list items, we process them as one block to avoid duplicate links per block
+    raw_list_content <- paste(landing_lines[6:8], collapse = " ||| ")
+    linked_content <- create_glossary_links(raw_list_content)
+    split_content <- unlist(strsplit(as.character(linked_content), " \\|\\|\\| "))
+    
+    tags$ul(style='margin-bottom:0;',
+      lapply(split_content, function(item) tags$li(HTML(item)))
+    )
+  })
+  
+  output$approach_header <- renderUI({ landing_lines[9] }) 
+  output$approach_text <- renderUI({ 
+    # Processed as a single block to manage link counts
+    full_approach <- paste(landing_lines[10:12], collapse = "<br>")
+    create_glossary_links(full_approach)
+  })
+  
+  output$steps_text <- renderUI({
+    raw_steps <- paste(landing_lines[13:length(landing_lines)], collapse = " ")
+    raw_steps <- gsub("NA|NA.", "", raw_steps)
+    
+    step1_raw <- str_extract(raw_steps, "1\\..*?(?=2\\.)")
+    step2_raw <- str_extract(raw_steps, "2\\..*?(?=Once)")
+    mid_instruction <- str_extract(raw_steps, "Once.*?\\. (?=3\\.)")
+    step3_raw <- str_extract(raw_steps, "3\\..*$")
+    
+    step1_fmt <- gsub("1\\. Select the model application :", "<strong>1.Select the model application:</strong>", step1_raw)
+    step2_fmt <- gsub("2\\. Select Model Type :", "<strong>2.Select Model Type:</strong>", step2_raw)
+    step3_clean <- gsub("^3\\.\\s*3\\.", "3.", step3_raw)
+    step3_fmt <- gsub("3\\. Select the model performance outcome and the risk tolerance :", "<strong>3.Select the model performance outcome and the risk tolerance:</strong>", step3_clean)
+    
+    # Processed together to ensure a term like 'model' only links once across the step-box
+    full_box_text <- paste(step1_fmt, "SPLIT_P", step2_fmt, "SPLIT_P", mid_instruction, "SPLIT_P", step3_fmt)
+    linked_box <- create_glossary_links(full_box_text)
+    final_steps <- unlist(strsplit(as.character(linked_box), " SPLIT_P "))
+    
+    tagList(
+      p(HTML(final_steps[1])),
+      p(HTML(final_steps[2])),
+      div(class='nav-hint', style="background: #fff; padding: 5px; border-radius: 4px; margin: 5px 0;", HTML(final_steps[3])),
+      p(HTML(final_steps[4]))
+    )
+  })
+
+  # --- Tab 3 Selection Display ---
+  output$selection_display_tab3 <- renderUI({
+    req(input$cat_select, input$subcat_select)
+    app_row <- apps %>% filter(Model_application_category == input$cat_select, Model_application_subcategory == input$subcat_select) %>% slice(1)
+    model_type <- if(is.null(input$type_select) || length(input$type_select) == 0 || input$type_select == "") "None selected" else input$type_select
+    practitioner_text <- app_row$What_practitioners_want
+    needs_split <- unlist(strsplit(practitioner_text, ",(?=[^,]*$|\\s*['\"])", perl = TRUE)) 
+    if(length(needs_split) < 2) needs_split <- c(practitioner_text, "")
+    get_risk_style <- function(level) {
+      color <- RISK_COLORS[level]
+      if(is.na(color)) color <- "#ffffff"
+      paste0("background-color: ", color, "; padding: 2px 8px; border-radius: 4px; font-weight: bold; border: 1px solid rgba(0,0,0,0.1); color: #333;")
+    }
+    
+    # Combine content to control link density
+    header_text <- paste0("You have selected: ", input$cat_select, " (", input$subcat_select, ") + ", model_type)
+    needs_text <- paste(needs_split, collapse = " | ")
+    
+    tagList(
+      h4(style = "color: #2c3e50; font-weight: bold; margin-bottom: 10px;", "Model Application Summary"),
+      div(class = "selection-bar", 
+          create_glossary_links(header_text),
+          div(style = "margin-top: 10px; font-weight: normal; font-size: 0.9em; border-top: 1px solid rgba(0,0,0,0.1); padding-top: 10px;",
+              strong("Model Outcome Performance & Risk suggested for the model application you have selected."), br(),
+              span(style = "margin-left: 10px;", "Omission errors: ", span(style = get_risk_style(app_row$Omission_errors), app_row$Omission_errors)),
+              span(style = "margin-left: 20px;", "Commission errors: ", span(style = get_risk_style(app_row$Commission_errors), app_row$Commission_errors)),
+              br(), br(),
+              strong("Practitioner Needs:"),
+              tags$ul(style = "margin-top: 5px; margin-bottom: 0;",
+                lapply(needs_split, function(n) tags$li(create_glossary_links(trimws(n))))
+              )
+          )
+      ),
+      h4(style = "color: #2c3e50; font-weight: bold; margin-top: 20px; margin-bottom: 15px; border-bottom: 2px solid #18bc9c; padding-bottom: 5px;", "Criteria selected based on your risk tolerance")
+    )
+  })
+
+  # --- Remaining logic unchanged ---
+  output$selection_display_tab2 <- renderUI({
+    req(input$cat_select, input$subcat_select)
+    model_type <- if(is.null(input$type_select) || length(input$type_select) == 0 || input$type_select == "") "None selected" else input$type_select
+    div(class = "selection-bar", paste0("You have selected: ", input$cat_select, " (", input$subcat_select, ") + ", model_type))
+  })
+
+  base_filtered <- reactive({
+    df <- criteria_df
+    if (!is.null(input$type_select) && length(input$type_select) > 0 && input$type_select != "") {
+      if (input$type_select %in% names(df)) { df <- df[df[[input$type_select]] == 1, ] }
+    }
+    df
+  })
+  
+  filtered_data <- reactive({
+    df <- base_filtered()
+    if (length(input$omission_filter) == 0 && length(input$commission_filter) == 0) return(df)
+    df %>% filter(Omission_errors %in% input$omission_filter | Commission_errors %in% input$commission_filter)
+  })
+
+  output$omission_count_header <- renderUI({
+    req(length(input$omission_filter) > 0)
+    count <- base_filtered() %>% filter(Omission_errors %in% input$omission_filter) %>% nrow()
+    span(class="count-badge", style="background: #2980b9;", paste(count, "out of", nrow(criteria_df), "Criteria Selected (Omission)"))
+  })
+  output$commission_count_header <- renderUI({
+    req(length(input$commission_filter) > 0)
+    count <- base_filtered() %>% filter(Commission_errors %in% input$commission_filter) %>% nrow()
+    span(class="count-badge", style="background: #8e44ad;", paste(count, "out of", nrow(criteria_df), "Criteria Selected (Commission)"))
+  })
+  output$combined_count_footer <- renderUI({
+    if (length(input$omission_filter) == 0 && length(input$commission_filter) == 0) {
+      req(input$type_select); count <- nrow(base_filtered())
+      span(class="count-badge", style="background: #7f8c8d;", paste(count, "out of", nrow(criteria_df), "Criteria"))
+    } else {
+      req(length(input$omission_filter) > 0 | length(input$commission_filter) > 0)
+      count <- nrow(filtered_data())
+      span(class="count-badge", style="background: #2c3e50;", paste(count, "out of", nrow(criteria_df), "Criteria Selected"))
+    }
+  })
+
+  output$radar_omission <- renderPlotly({ req(length(input$omission_filter) > 0); render_radar_logic(base_filtered(), "Omission_errors", input$omission_filter) })
+  output$radar_commission <- renderPlotly({ req(length(input$commission_filter) > 0); render_radar_logic(base_filtered(), "Commission_errors", input$commission_filter) })
+
+  render_radar_logic <- function(df_base, error_col, filter_input) {
+    stages <- sort(unique(criteria_df$Key_stages)); stages <- stages[stages != "" & !is.na(stages)]
+    max_range <- if ("High" %in% filter_input) 15 else 10
+    p <- plot_ly(type = 'scatterpolar', fill = 'toself')
+    for (lvl in RISK_LEVELS) {
+      if (lvl %in% filter_input) {
+        counts <- df_base %>% filter(!!sym(error_col) == lvl) %>% group_by(Key_stages) %>% summarise(n = n(), .groups = 'drop')
+        plot_df <- data.frame(Key_stages = stages) %>% left_join(counts, by = "Key_stages") %>% mutate(n = ifelse(is.na(n), 0, n))
+        display_labels <- gsub("Data quality, relevance and preparation", "Data<br>sets", plot_df$Key_stages)
+        display_labels <- gsub("Model assessment", "Model<br>assessment", display_labels)
+        p <- p %>% add_trace(r = c(plot_df$n, plot_df$n[1]), theta = c(display_labels, display_labels[1]), name = lvl, fillcolor = RISK_COLORS[lvl], line = list(color = RISK_BORDER_COLORS[lvl], width = 2), opacity = 0.5)
+      }
+    }
+    p %>% layout(polar = list(domain = list(x = c(0, 1), y = c(0, 1)), radialaxis = list(visible = TRUE, range = c(0, max_range))), margin = list(l=75, r=75, t=10, b=10), showlegend = FALSE)
+  }
+
+  output$criteria_tables_ui <- renderUI({
+    data <- filtered_data(); if(nrow(data) == 0) return(NULL); stages <- unique(data$Key_stages)
+    map(stages, function(s) { tagList(h5(style="margin-top:15px; border-bottom: 1px solid #ccc; font-weight:bold; font-size: 0.9em;", s), DTOutput(paste0("table_", gsub("[^[:alnum:]]", "_", s)))) })
+  })
+
+  observe({
+    data <- filtered_data()
+    for (s in unique(data$Key_stages)) {
+      local({
+        curr_s <- s
+        output[[paste0("table_", gsub("[^[:alnum:]]", "_", curr_s))]] <- renderDT({
+          df_subset <- data %>% filter(Key_stages == curr_s) %>% select(Criterion, Omission_errors, Commission_errors) %>% mutate(Omission_errors = ifelse(Omission_errors %in% input$omission_filter, Omission_errors, ""), Commission_errors = ifelse(Commission_errors %in% input$commission_filter, Commission_errors, ""))
+          df_subset <- df_subset %>% rename(`Omission<br>errors` = Omission_errors, `Commission<br>errors` = Commission_errors)
+          datatable(df_subset, selection = 'single', rownames = FALSE, escape = FALSE, options = list(dom = 't', paging = FALSE, autoWidth = FALSE)) %>% 
+            formatStyle('Omission<br>errors', backgroundColor = styleEqual(names(RISK_COLORS), RISK_COLORS, default = "white")) %>%
+            formatStyle('Commission<br>errors', backgroundColor = styleEqual(names(RISK_COLORS), RISK_COLORS, default = "white"))
+        })
+        observeEvent(input[[paste0("table_", gsub("[^[:alnum:]]", "_", curr_s), "_rows_selected")]], {
+          idx <- input[[paste0("table_", gsub("[^[:alnum:]]", "_", curr_s), "_rows_selected")]]; selected_row_data(data %>% filter(Key_stages == curr_s) %>% slice(idx))
+        })
+      })
+    }
+  })
+
+  output$app_profile_display <- renderUI({
+    req(input$cat_select, input$subcat_select)
+    row <- apps %>% filter(Model_application_category == input$cat_select, Model_application_subcategory == input$subcat_select) %>% slice(1)
+    type_def <- if (!is.null(input$type_select) && length(input$type_select) > 0 && input$type_select != "") {
+      def_row <- glossary %>% filter(Term == input$type_select); if(nrow(def_row) > 0) def_row$Definition else ""
+    } else { "" }
+    tagList(
+      div(style = "border: 1px solid #dee2e6; padding: 15px; border-radius: 10px; background-color: #ffffff; margin-bottom: 15px;", h3(style = "color: #2c3e50; border-bottom: 2px solid #2c3e50;", row$Model_application_category), p(em(create_glossary_links(row$Definition)))),
+      div(style = "border: 1px solid #dee2e6; padding: 15px; border-radius: 10px; background-color: #f8f9fa; margin-bottom: 15px;", 
+          h4(style = "color: #18bc9c;", row$Model_application_subcategory), 
+          hr(), 
+          p(strong("Purpose: "), create_glossary_links(row[["Purpose_problem_to solve"]])), 
+          p(strong("Decision Impact: "), create_glossary_links(row$How_predictions_inform_decisions)), 
+          p(strong("Reference Example: "), HTML(as.character(row$Reference_example)))),
+      if (type_def != "") div(style = "border: 1px solid #dee2e6; padding: 15px; border-radius: 10px; background-color: #e8f4f8;", h4(style = "color: #2980b9; font-size: 1.1em;", paste("Selected Model Type:", input$type_select)), p(style = "margin-bottom: 0; font-size: 1em;", create_glossary_links(type_def)))
+    )
+  })
+
+  output$details_panel <- renderUI({
+    res <- selected_row_data()
+    if (is.null(res)) return(p(em("Click a criterion to view details.")))
+    solutions <- res$Potential_Solutions
+    if (!is.na(solutions) && solutions != "") {
+      solutions_list <- unlist(strsplit(solutions, "(?<=\\.)(?=,)", perl = TRUE))
+      solutions_list <- gsub("^,", "", solutions_list); solutions_list <- solutions_list[solutions_list != ""]
+      solutions_html <- tags$ul(style = "margin-bottom: 0; padding-left: 20px;", lapply(solutions_list, function(x) tags$li(create_glossary_links(trimws(x)))))
+    } else { solutions_html <- p("No solutions provided.") }
+    tagList(
+      p(strong("Criterion: "), res$Criterion), p(strong("Assumption:"), br(), create_glossary_links(res$Assumption_Description)), 
+      p(strong(style="color: #d63384;", "Violation Risks:"), br(), div(style="font-size: 0.85em; background-color: #fff0f7; padding: 8px; border-left: 4px solid #d63384;", create_glossary_links(res$Violation_of_Assumptions))), 
+      p(strong(style="color: #27ae60;", "Potential Solutions:"), br(), div(style="font-size: 0.85em; background-color: #f4fdf7; padding: 8px; border-left: 4px solid #27ae60;", solutions_html)), 
+      p(strong("Reference: "), br(), span(style="font-size: 0.8em;", HTML(as.character(res$Author_reference))))
+    )
+  })
+
+  output$subcat_ui <- renderUI({
+    req(input$cat_select); choices <- apps %>% filter(Model_application_category == input$cat_select) %>% pull(Model_application_subcategory) %>% unique() %>% sort()
+    selectInput("subcat_select", "Select Application Subcategory:", choices = choices)
+  })
+
+  observeEvent(input$glossary_click, {
+    term_info <- glossary %>% filter(Term == input$glossary_click) %>% slice(1)
+    clean_val <- function(x) if(is.na(x) || x == "" || x == "NA") NULL else x
+    showModal(modalDialog(title = span(style="color: #2980b9; font-weight: bold;", term_info$Term), p(strong("Definition:"), br(), term_info$Definition), if(!is.null(clean_val(term_info$`Some examples`))) p(strong("Examples:"), br(), em(clean_val(term_info$`Some examples`))) else NULL, easyClose = TRUE, footer = modalButton("Close")))
+  })
+}
+
+shinyApp(ui = ui, server = server)
+```
